@@ -86,6 +86,27 @@ func (l *Limiter) AllowN(key []byte, cost float64) bool {
 	return false
 }
 
+// WouldAllowN reports whether a cost request would be admitted for key WITHOUT
+// debiting. Paired with DebitN, it lets several limiters be composed
+// (multi-window, multi-dimension) without refund bookkeeping: check every
+// limiter, then debit all only if every check passed. cost is validated as in
+// AllowN.
+func (l *Limiter) WouldAllowN(key []byte, cost float64) bool {
+	checkCost(cost)
+	if cost > l.burst {
+		return false
+	}
+	return l.rot.Query(key)+cost <= l.burst
+}
+
+// DebitN unconditionally charges cost to key (clamped at MaxDebt). It is the
+// commit half of the WouldAllowN/DebitN pair; on its own it does not check
+// headroom.
+func (l *Limiter) DebitN(key []byte, cost float64) {
+	checkCost(cost)
+	l.rot.Update(key, cost)
+}
+
 // Spent returns the current debt estimate for key (observability). It reflects
 // decay to the current time.
 func (l *Limiter) Spent(key []byte) float64 { return l.rot.Query(key) }
