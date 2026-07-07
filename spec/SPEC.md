@@ -175,10 +175,20 @@ production hook (correct `Retry-After` headers, which windowed limiters can
 only approximate):
 
 ```
-RetryAfter = 0                                if admitted
-           = NeverRetry                       if cost > Burst
-           = (spent + cost − Burst) / Rate    otherwise (round up to ~ms)
+RetryAfter = 0                                  if admitted
+           = NeverRetry                         if cost > Burst
+           = (debt' + cost − Burst) / Rate      otherwise (round up to ~ms)
+
+where debt' = min(spent + RejectCost, MaxDebt)  — the post-penalty debt
 ```
+
+`debt'` MUST include the reject penalty the limiter itself just applied
+(§3.3): computing RetryAfter from pre-penalty debt makes the header
+systematically short whenever `RejectCost > 0`, so a compliant client that
+waits exactly RetryAfter is rejected again and re-penalized — a
+re-penalization loop for exactly the clients Retry-After exists to serve.
+With `RejectCost = 0`, `debt' = spent` and the formula reduces to the plain
+form.
 
 In optimistic mode `spent` comes from the Query already performed. In strict
 mode TryUpdate returns only a verdict, so `Spent` and `RetryAfter` come from
@@ -269,6 +279,12 @@ avoids both the debit-then-refund leak and refund's clamp interactions. A
 strict composite (locking multiple sketches in canonical order) is out of
 scope until someone needs it. v1 MAY ship a `MultiLimiter` convenience
 wrapping exactly this recipe; nothing more.
+
+Two consequences of the non-mutating check, ratified as intended behavior:
+composition through `WouldAllowN` never applies members' `RejectCost`
+(penalties are a single-limiter feature), and it is always optimistic even
+when members are configured `Strict` (strictness applies to their own
+`AllowN` path, not to the composite).
 
 ---
 
