@@ -53,9 +53,16 @@ func (l *Limiter) AllowDetailed(key []byte, cost float64) Decision {
 }
 
 // retryAfter returns the time for enough debt to drain that cost would fit,
-// rounded up to the millisecond. Callers reach it only when spent+cost > Burst.
+// rounded up to the millisecond. Callers reach it only on rejection, after
+// penalize has run — so the wait is computed from the post-penalty debt
+// min(spent+RejectCost, MaxDebt); otherwise the header would be systematically
+// short and a client honoring it would be rejected and re-penalized on return.
 func (l *Limiter) retryAfter(spent, cost float64) time.Duration {
-	excess := spent + cost - l.burst
+	debt := spent
+	if l.rejectCost > 0 {
+		debt = math.Min(spent+l.rejectCost, l.maxDebt)
+	}
+	excess := debt + cost - l.burst
 	if excess <= 0 {
 		return 0
 	}
