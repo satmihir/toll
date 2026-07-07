@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>toll — token buckets for unbounded keys</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #16213b;
+    --text: #e2e8f0; --muted: #94a3b8; --faint: #475569;
+    --blue: #3b82f6; --green: #10b981; --amber: #f59e0b; --red: #ef4444;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    display: flex; flex-direction: column; align-items: center; min-height: 100vh;
+  }
+  .stage { position: relative; margin-top: 16px; }
+  canvas { display: block; width: 1280px; height: 720px; background: var(--bg); }
+  .controls {
+    width: 1280px; display: flex; gap: 12px; align-items: center;
+    padding: 12px 4px; color: var(--muted); font-size: 14px;
+  }
+  .controls button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--faint);
+    border-radius: 6px; padding: 6px 16px; font-size: 14px; cursor: pointer;
+  }
+  .controls input[type=range] { flex: 1; }
+  body.recording .controls { display: none; }
+  body.recording { overflow: hidden; }
+  body.recording .stage { margin: 0; }
+  body.recording canvas { width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<div class="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div class="controls">
+  <button id="playBtn">Pause</button>
+  <input type="range" id="scrub" min="0" max="36" step="0.01" value="0">
+  <span id="clock">0.0s</span>
+  <span style="margin-left:auto">?recording=1 for clean capture · ?t=SECONDS for a fixed frame</span>
+</div>
+<script src="trace.js"></script>
+<script>
+"use strict";
+const T = window.TOLL_TRACE;
+const DUR = 36;                       // total video seconds
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const W = 1920, H = 1080;
+
+const url = new URL(window.location.href);
+const recording = url.searchParams.get("recording") === "1";
+const fixedT = url.searchParams.get("t");
+if (recording) document.body.classList.add("recording");
+
+// ---------- palette ----------
+const BG = "#0f172a", PANEL = "#1e293b", TEXT = "#e2e8f0", MUTED = "#94a3b8",
+      FAINT = "#334155", BLUE = "#3b82f6", GREEN = "#10b981", AMBER = "#f59e0b",
+      RED = "#ef4444", GRAY = "#64748b";
+
+// ---------- timeline ----------
+// scene boundaries (seconds)
+const S_TITLE = [0, 2.0], S_ACT1 = [2.0, 11.5], S_ACT2 = [11.5, 22.0],
+      S_ACT3 = [22.0, 32.0], S_END = [32.0, 36.0];
+const XFADE = 0.5; // seconds of fade at each scene edge
+
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const easeOut = p => 1 - Math.pow(1 - p, 3);
+// progress within [a,b]
+const prog = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+// fade envelope: 0->1 in first XFADE, 1->0 in last XFADE
+function fade(t, a, b) {
+  return Math.min(prog(t, a, a + XFADE), 1 - prog(t, b - XFADE, b));
+}
+
+// per-scene sim playback: scene time maps to sim ticks with a tail hold
+function simIndex(t, a, b, holdS = 1.2) {
+  const p = prog(t, a, b - holdS);
+  return Math.min(T.actA.baseline.length - 1, Math.floor(p * (T.actA.baseline.length - 1)));
+}
+
+// rolling mean over +-k ticks for smooth bars
+function smooth(series, tick, ci, k = 4) {
+  let sum = 0, n = 0;
+  for (let i = Math.max(0, tick - k); i <= Math.min(series.length - 1, tick + k); i++) {
+    sum += series[i][ci]; n++;
+  }
+  return sum / n;
+}
+
+// ---------- primitives ----------
+function text(str, x, y, size, color, weight = 400, align = "left") {
+  ctx.fillStyle = color;
+  ctx.font = `${weight} ${size}px -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = "alphabetic";
+  ctx.fillText(str, x, y);
+}
+function rrect(x, y, w, h, r, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill();
+}
+function caption(n, title, alpha) {
+  ctx.globalAlpha = alpha;
+  rrect(80, 60, 44, 44, 8, PANEL);
+  text(String(n), 102, 90, 24, BLUE, 600, "center");
+  text(title, 144, 90, 30, TEXT, 600);
+  ctx.globalAlpha = 1;
+}
+function metricCard(x, y, w, label, value, color, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  rrect(x, y, w, 108, 10, PANEL);
+  text(label, x + 24, y + 40, 20, MUTED, 400);
+  text(value, x + 24, y + 84, 34, color, 600);
+  ctx.globalAlpha = 1;
+}
+
+// ---------- scene: title ----------
+function drawTitle(t) {
+  const a = fade(t, ...S_TITLE);
+  ctx.globalAlpha = a;
+  text("One API. Twelve clients. Three of them are greedy.", W / 2, 480, 52, TEXT, 600, "center");
+  text("Rate limiting with toll — token buckets for unbounded keys in constant memory", W / 2, 550, 28, MUTED, 400, "center");
+  ctx.globalAlpha = 1;
+}
+
+// ---------- client lanes (acts 1 & 2) ----------
+const LANE_X = 80, LANE_W = 1350, LANE_TOP = 220, LANE_H = 52, LANE_GAP = 12;
+const RATE_MAX = 320; // px scale: req/s at full lane width
+
+function drawLanes(t, scene, series, withLimits) {
+  const [a0, b0] = scene;
+  const alpha = fade(t, a0, b0);
+  const tick = simIndex(t, a0, b0);
+  const simT = (tick * T.meta.tickMs / 1000).toFixed(0);
+  ctx.globalAlpha = alpha;
+
+  // capacity bar
+  let total = 0;
+  for (let ci = 0; ci < T.actA.clients.length; ci++) total += smooth(series, tick, ci);
+  const capY = 150, capW = LANE_W;
+  rrect(LANE_X, capY, capW, 26, 6, PANEL);
+  const capFill = clamp(total / T.meta.capacity, 0, 1);
+  rrect(LANE_X, capY, capW * capFill, 26, 6, capFill > 0.97 ? RED : BLUE);
+  text(`API capacity ${Math.round(total)} / ${T.meta.capacity} req/s`, LANE_X + capW + 24, capY + 20, 22, MUTED);
+  text(`t = ${simT}s`, W - 100, capY + 20, 22, FAINT, 400, "right");
+
+  // lanes
+  T.actA.clients.forEach((c, ci) => {
+    const y = LANE_TOP + ci * (LANE_H + LANE_GAP);
+    const admitted = smooth(series, tick, ci);
+    const greedy = c.kind === "greedy";
+
+    text(c.id, LANE_X, y + 34, 22, greedy ? TEXT : MUTED, greedy ? 600 : 400);
+    const barX = LANE_X + 200, barW = LANE_W - 200;
+    rrect(barX, y + 8, barW, LANE_H - 16, 6, PANEL);
+    // demand ghost
+    rrect(barX, y + 8, barW * clamp(c.want / RATE_MAX, 0, 1), LANE_H - 16, 6, "#26334d");
+    // admitted
+    let color = greedy ? RED : GRAY;
+    if (withLimits) {
+      const clamped = greedy && Math.abs(admitted - T.meta.perKeyRate) < 3;
+      color = greedy ? (clamped ? AMBER : RED) : GREEN;
+    }
+    rrect(barX, y + 8, barW * clamp(admitted / RATE_MAX, 0, 1), LANE_H - 16, 6, color);
+    // limit tick
+    if (withLimits) {
+      const lx = barX + barW * (T.meta.perKeyRate / RATE_MAX);
+      ctx.fillStyle = TEXT;
+      ctx.fillRect(lx - 1, y + 4, 2, LANE_H - 8);
+    }
+    text(`${Math.round(admitted)}/s`, barX + barW + 20, y + 34, 22,
+         withLimits ? (greedy ? AMBER : GREEN) : (greedy ? RED : MUTED), 600);
+  });
+  text("faint bar = demand   ·   compliant clients want 20/s, greedy want 300/s",
+       LANE_X + 200, LANE_TOP + 12 * (LANE_H + LANE_GAP) + 28, 20, FAINT);
+  ctx.globalAlpha = 1;
+  return { alpha, tick };
+}
+
+function drawAct1(t) {
+  const { alpha, tick } = drawLanes(t, S_ACT1, T.actA.baseline, false);
+  caption(1, "Without a limiter", alpha);
+  const p = prog(t, S_ACT1[0], S_ACT1[1]);
+  if (p > 0.45) {
+    const a = alpha * easeOut(prog(t, S_ACT1[0] + 4.0, S_ACT1[0] + 5.0));
+    metricCard(1530, 220, 340, "greedy clients take", `${T.stats.greedySharePct.toFixed(0)}% of capacity`, RED, a);
+    metricCard(1530, 352, 340, "everyone else gets", `${T.stats.compliantBaselineRate.toFixed(0)} of 20 req/s`, GRAY, a);
+  }
+}
+
+function drawAct2(t) {
+  const { alpha } = drawLanes(t, S_ACT2, T.actA.toll, true);
+  caption(2, "With toll — Rate 40, Burst 60 per key", alpha);
+  const base = S_ACT2[0];
+  const a1 = alpha * easeOut(prog(t, base + 3.5, base + 4.5));
+  metricCard(1530, 220, 340, "compliant clients rejected", "0", GREEN, a1);
+  const a2 = alpha * easeOut(prog(t, base + 5.5, base + 6.5));
+  metricCard(1530, 352, 340, "greedy clients held to", `${T.stats.greedySteadyRate.toFixed(0)} req/s`, AMBER, a2);
+  const a3 = alpha * easeOut(prog(t, base + 7.5, base + 8.5));
+  metricCard(1530, 484, 340, "rejected requests get", "429 + Retry-After", BLUE, a3);
+}
+
+// ---------- act 3: split panel ----------
+// rolling-mean smoothing for chart series (same idea as lane smoothing)
+function smoothSeries(points, k = 6) {
+  return points.map((_, i) => {
+    let sum = 0, n = 0;
+    for (let j = Math.max(0, i - k); j <= Math.min(points.length - 1, i + k); j++) {
+      sum += points[j]; n++;
+    }
+    return sum / n;
+  });
+}
+
+function lineChart(x, y, w, h, points, maxY, color, drawP, ceiling) {
+  rrect(x, y, w, h, 10, PANEL);
+  // axis labels
+  text(`${Math.round(maxY)}/s`, x + 12, y + 28, 18, FAINT);
+  if (ceiling) {
+    const cy = y + h - (ceiling / maxY) * (h - 40) - 20;
+    ctx.strokeStyle = TEXT; ctx.setLineDash([8, 8]); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x + 10, cy); ctx.lineTo(x + w - 10, cy); ctx.stroke();
+    ctx.setLineDash([]);
+    text(`ceiling ${ceiling}/s  =  cells × rate`, x + w - 24, cy + 34, 20, TEXT, 400, "right");
+  }
+  const n = Math.max(2, Math.floor(points.length * drawP));
+  ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const px = x + 10 + (i / (points.length - 1)) * (w - 20);
+    const py = y + h - 20 - clamp(points[i] / maxY, 0, 1) * (h - 40);
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+}
+
+function fmtBytes(b) {
+  if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB";
+  return Math.round(b / 1024) + " KB";
+}
+
+function drawAct3(t) {
+  const [a0, b0] = S_ACT3;
+  const alpha = fade(t, a0, b0);
+  ctx.globalAlpha = alpha;
+  caption(3, "Key-rotation attack — 5,000 req/s, fresh key every request", alpha);
+
+  const p = easeOut(prog(t, a0 + 0.4, b0 - 2.2));
+  if (!drawAct3.cache) {
+    drawAct3.cache = {
+      map: smoothSeries(T.actB.map(s => s.mapAdmitted)),
+      toll: smoothSeries(T.actB.map(s => s.tollAdmitted)),
+    };
+  }
+  const mapAdm = drawAct3.cache.map, tollAdm = drawAct3.cache.toll;
+  const idx = Math.max(1, Math.floor(T.actB.length * p) - 1);
+
+  const colW = 850, colH = 470, y0 = 240;
+  const lx = 80, rx = W - 80 - colW;
+
+  text("map of token buckets", lx + colW / 2, y0 - 24, 28, TEXT, 600, "center");
+  text("toll", rx + colW / 2, y0 - 24, 28, TEXT, 600, "center");
+
+  lineChart(lx, y0, colW, colH, mapAdm, 5500, RED, p, null);
+  lineChart(rx, y0, colW, colH, tollAdm, 5500, GREEN, p, T.meta.ceiling);
+  text("attack admitted", lx + 20, y0 + colH - 34, 20, MUTED);
+  text("attack admitted", rx + 20, y0 + colH - 34, 20, MUTED);
+
+  // state size cards
+  const sMap = T.actB[idx].mapBytes, sToll = T.actB[idx].tollBytes;
+  metricCard(lx, y0 + colH + 40, 400, "admitted", `${Math.round(mapAdm[idx])}/s  (100%)`, RED, alpha);
+  metricCard(lx + 450, y0 + colH + 40, 400, "state size", `${fmtBytes(sMap)}  and growing`, RED, alpha);
+  metricCard(rx, y0 + colH + 40, 400, "admitted", `${Math.round(tollAdm[idx])}/s  (capped)`, GREEN, alpha);
+  metricCard(rx + 450, y0 + colH + 40, 400, "state size", `${fmtBytes(sToll)}  flat`, GREEN, alpha);
+
+  const at = alpha * easeOut(prog(t, b0 - 3.2, b0 - 2.2));
+  ctx.globalAlpha = at;
+  text("Per-key limiters can't stop key rotation. toll caps the total and never grows: it fails closed, not open.",
+       W / 2, y0 + colH + 220, 30, TEXT, 600, "center");
+  ctx.globalAlpha = 1;
+}
+
+// ---------- end card ----------
+function drawEnd(t) {
+  const a = fade(t, S_END[0], S_END[1] + XFADE); // no fade-out at very end
+  ctx.globalAlpha = Math.min(a, prog(t, S_END[0], S_END[0] + XFADE));
+  text("toll", W / 2, 420, 110, TEXT, 700, "center");
+  text("token-bucket rate limiting for unbounded keys in constant memory", W / 2, 500, 32, MUTED, 400, "center");
+  const stats = `0 compliant rejections   ·   limits held exactly   ·   ${fmtBytes(T.stats.tollBytes)} of state under a 5,000/s attack`;
+  text(stats, W / 2, 590, 26, GREEN, 400, "center");
+  text("github.com/satmihir/toll   ·   built on grudge", W / 2, 680, 30, BLUE, 600, "center");
+  ctx.globalAlpha = 1;
+}
+
+// ---------- main render ----------
+function render(t) {
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, W, H);
+  if (t < S_TITLE[1]) drawTitle(t);
+  if (t >= S_ACT1[0] - XFADE && t < S_ACT1[1]) drawAct1(t);
+  if (t >= S_ACT2[0] - XFADE && t < S_ACT2[1]) drawAct2(t);
+  if (t >= S_ACT3[0] - XFADE && t < S_ACT3[1]) drawAct3(t);
+  if (t >= S_END[0] - XFADE) drawEnd(t);
+}
+
+// ---------- playback ----------
+let playing = fixedT === null;
+let cur = fixedT === null ? 0 : clamp(Number(fixedT), 0, DUR);
+let last = performance.now();
+const playBtn = document.getElementById("playBtn");
+const scrub = document.getElementById("scrub");
+const clockEl = document.getElementById("clock");
+
+window.__setTime = (t) => { cur = clamp(t, 0, DUR); playing = false; render(cur); };
+window.__READY = true;
+
+playBtn.addEventListener("click", () => {
+  playing = !playing;
+  playBtn.textContent = playing ? "Pause" : "Play";
+  if (cur >= DUR) cur = 0;
+});
+scrub.addEventListener("input", () => { cur = Number(scrub.value); playing = false; playBtn.textContent = "Play"; render(cur); });
+
+function loop(now) {
+  if (playing) {
+    cur = Math.min(DUR, cur + (now - last) / 1000);
+    if (cur >= DUR) { playing = false; playBtn.textContent = "Replay"; }
+  }
+  last = now;
+  scrub.value = String(cur);
+  clockEl.textContent = cur.toFixed(1) + "s";
+  render(cur);
+  requestAnimationFrame(loop);
+}
+render(cur);
+if (fixedT === null) requestAnimationFrame(loop);
+</script>
+</body>
+</html>

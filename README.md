@@ -21,6 +21,12 @@ if l.Allow(clientID) {
 }
 ```
 
+## See it under load
+
+[![toll demo: noisy neighbors and a key-rotation attack](demo/visual/toll-demo-thumbnail.png)](demo/visual/toll-demo.mp4)
+
+Three greedy clients grabbing 83% of an API, held to exactly their limit with zero compliant-client rejections — then a 5,000 req/s key-rotation attack that a map-of-buckets limiter admits in full (state growing forever) while toll caps it at the sizing ceiling in 125 KB of flat state. Deterministic simulation of the real API; see [demo/visual](demo/visual/README.md) to regenerate.
+
 ## Why not a map of buckets?
 
 The standard per-key limiter keeps one bucket per key in a hashmap. Memory grows with key cardinality, so you add LRU eviction — and eviction *is* the failure mode: evicting an active abuser's bucket hands them a fresh one. Redis-backed limiters fix the memory by adding a network hop to every request. toll keeps a fixed-size sketch instead: a few MB covers any number of keys, nothing is ever evicted, and decisions stay in-process.
