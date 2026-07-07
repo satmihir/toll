@@ -90,6 +90,14 @@ function smooth(series, tick, ci, k = 4) {
   return sum / n;
 }
 
+// deterministic 0..1 hash for particle fates (stable across seeks)
+function h01(n) {
+  let x = (n ^ 0x9e3779b9) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0;
+  return ((x ^ (x >>> 16)) >>> 0) % 1000 / 1000;
+}
+
 // ---------- primitives ----------
 function text(str, x, y, size, color, weight = 400, align = "left") {
   ctx.fillStyle = color;
@@ -172,8 +180,43 @@ function drawLanes(t, scene, series, withLimits) {
     }
     text(`${Math.round(admitted)}/s`, barX + barW + 20, y + 34, 22,
          withLimits ? (greedy ? AMBER : GREEN) : (greedy ? RED : MUTED), 600);
+
+    // request particles: spawn cadence tracks demand, fate tracks the trace.
+    // Admitted dots ride the lane; rejected dots die at the admitted-bar edge
+    // (the capacity edge in act 1, the limit in act 2) with a brief flash.
+    const dotRate = greedy ? 7 : 2.5;      // visual dots/s, not to scale
+    const travel = 2.0;                     // s to cross the lane
+    const ratio = clamp(admitted / c.want, 0, 1);
+    const edgeX = barX + barW * clamp(admitted / RATE_MAX, 0, 1);
+    const gap = 1 / dotRate;
+    const phase = h01(ci * 101) * gap;
+    const first = Math.ceil((t - travel - phase) / gap);
+    for (let k = first; k * gap + phase <= t; k++) {
+      const t0 = k * gap + phase;
+      const age = (t - t0) / travel;
+      const pass = h01(k * 13 + ci * 7) < ratio;
+      const dotColor = withLimits ? (greedy ? AMBER : GREEN) : (greedy ? RED : "#8ea0bd");
+      if (pass) {
+        const px = barX + age * (barW - 12);
+        ctx.globalAlpha = alpha * clamp(Math.min(age * 8, (1 - age) * 8), 0, 0.9);
+        rrect(px, y + LANE_H / 2 - 4, 9, 6, 3, dotColor);
+      } else {
+        // travels to the edge, then flashes out
+        const edgeAge = clamp((edgeX - barX) / (barW - 12), 0.02, 1);
+        if (age < edgeAge) {
+          const px = barX + age * (barW - 12);
+          ctx.globalAlpha = alpha * clamp(age * 8, 0, 0.9);
+          rrect(px, y + LANE_H / 2 - 4, 9, 6, 3, dotColor);
+        } else if (age < edgeAge + 0.18) {
+          const f = 1 - (age - edgeAge) / 0.18;
+          ctx.globalAlpha = alpha * f * 0.95;
+          rrect(edgeX - 2, y + LANE_H / 2 - 6, 10, 10, 5, RED);
+        }
+      }
+      ctx.globalAlpha = alpha;
+    }
   });
-  text("faint bar = demand   ·   compliant clients want 20/s, greedy want 300/s",
+  text("faint bar = demand   ·   compliant clients want 20/s, greedy want 300/s   ·   dots = requests (not to scale)",
        LANE_X + 200, LANE_TOP + 12 * (LANE_H + LANE_GAP) + 28, 20, FAINT);
   ctx.globalAlpha = 1;
   return { alpha, tick };
@@ -267,12 +310,58 @@ function drawAct3(t) {
   text("attack admitted", lx + 20, y0 + colH - 34, 20, MUTED);
   text("attack admitted", rx + 20, y0 + colH - 34, 20, MUTED);
 
-  // state size cards
+  // request rain: dots fall into each panel; every dot passes on the map
+  // side, while on toll's side each dot's fate follows the recorded pass
+  // probability at its spawn moment — rejected dots die on the ceiling line.
+  const ceilY = y0 + colH - (T.meta.ceiling / 5500) * (colH - 40) - 20;
+  const fall = 1.0, cols = 26, colGap = 0.5;
+  const rain = (x0, isToll) => {
+    for (let c = 0; c < cols; c++) {
+      const cx = x0 + 30 + (c / (cols - 1)) * (colW - 60);
+      const phase = h01(c * 31 + (isToll ? 7 : 0)) * colGap;
+      const first = Math.ceil((t - fall - phase) / colGap);
+      for (let k = first; k * colGap + phase <= t; k++) {
+        const t0 = k * colGap + phase;
+        if (t0 < a0 + 0.4) continue;
+        const age = (t - t0) / fall;
+        const p0 = easeOut(prog(t0, a0 + 0.4, b0 - 2.2));
+        const i0 = Math.max(0, Math.floor(T.actB.length * p0) - 1);
+        const passProb = isToll ? tollAdm[i0] / T.meta.attackRate : 1;
+        const pass = h01(k * 17 + c * 53) < passProb;
+        const yTop = y0 + 14, yBot = y0 + colH - 46;
+        const stopY = isToll && !pass ? ceilY : yBot;
+        const yNow = yTop + age * (yBot - yTop);
+        ctx.globalAlpha = alpha * 0.7;
+        if (yNow < stopY) {
+          ctx.globalAlpha *= clamp(Math.min(age * 6, (1 - age) * 6), 0, 1);
+          rrect(cx, yNow, 5, 9, 2.5, isToll ? (pass ? GREEN : "#7dd3b0") : RED);
+        } else if (!pass && isToll) {
+          const over = (yNow - stopY) / (yBot - yTop);
+          if (over < 0.25) {
+            ctx.globalAlpha *= (1 - over / 0.25) * 0.9;
+            rrect(cx - 2, stopY - 4, 9, 9, 4.5, "#f8fafc");
+          }
+        }
+        ctx.globalAlpha = alpha;
+      }
+    }
+  };
+  rain(lx, false);
+  rain(rx, true);
+
+  // state size cards, with a growing-vs-flat bar inside the state cards
   const sMap = T.actB[idx].mapBytes, sToll = T.actB[idx].tollBytes;
+  const finalMap = T.stats.mapBytesEnd;
   metricCard(lx, y0 + colH + 40, 400, "admitted", `${Math.round(mapAdm[idx])}/s  (100%)`, RED, alpha);
   metricCard(lx + 450, y0 + colH + 40, 400, "state size", `${fmtBytes(sMap)}  and growing`, RED, alpha);
   metricCard(rx, y0 + colH + 40, 400, "admitted", `${Math.round(tollAdm[idx])}/s  (capped)`, GREEN, alpha);
   metricCard(rx + 450, y0 + colH + 40, 400, "state size", `${fmtBytes(sToll)}  flat`, GREEN, alpha);
+  ctx.globalAlpha = alpha;
+  rrect(lx + 450 + 24, y0 + colH + 40 + 90, 352, 6, 3, FAINT);
+  rrect(lx + 450 + 24, y0 + colH + 40 + 90, 352 * clamp(sMap / finalMap, 0, 1), 6, 3, RED);
+  rrect(rx + 450 + 24, y0 + colH + 40 + 90, 352, 6, 3, FAINT);
+  rrect(rx + 450 + 24, y0 + colH + 40 + 90, Math.max(4, 352 * clamp(sToll / finalMap, 0, 1)), 6, 3, GREEN);
+  ctx.globalAlpha = 1;
 
   const at = alpha * easeOut(prog(t, b0 - 3.2, b0 - 2.2));
   ctx.globalAlpha = at;
