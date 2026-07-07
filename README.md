@@ -4,14 +4,14 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/satmihir/toll.svg)](https://pkg.go.dev/github.com/satmihir/toll)
 [![Go Report Card](https://goreportcard.com/badge/github.com/satmihir/toll)](https://goreportcard.com/report/github.com/satmihir/toll)
 
-**A per-key token-bucket rate limiter for unbounded key spaces in constant memory.**
+**Token-bucket rate limiting for millions of keys in a few megabytes — no per-key state, no eviction, no network hop.**
 
-toll rate-limits an unbounded set of keys (client IDs, tenants, IPs, API keys…) in a few megabytes of fixed memory: no per-key map, no eviction, no background work, ~110ns zero-allocation decisions. It's built on [grudge](https://github.com/satmihir/grudge), a decaying-score sketch — toll stores each key's *spent tokens* in the sketch and lets grudge's linear decay refill them.
+toll rate-limits an unbounded set of keys (client IDs, tenants, IPs, API keys…) in fixed memory with ~110ns zero-allocation decisions. It is built on [grudge](https://github.com/satmihir/grudge), a constant-memory decaying-score sketch: toll stores each key's *spent tokens* as sketch debt and lets grudge's linear decay refill them.
 
 ```go
 import "github.com/satmihir/toll"
 
-l, err := toll.New(toll.Config{Rate: 100, Burst: 200}) // 100 tokens/sec, burst of 200
+l, err := toll.New(toll.Config{Rate: 100, Burst: 200}) // 100 tokens/sec, bursts to 200
 defer l.Close()
 
 if l.Allow(clientID) {
@@ -23,56 +23,73 @@ if l.Allow(clientID) {
 
 ## Why not a map of buckets?
 
-The usual per-key limiter keeps a bucket per key in a hashmap — memory grows with cardinality, and you need LRU eviction, where eviction *is* the failure mode: evicting an active abuser's bucket resets their limit. Redis-backed limiters trade that for a network hop on every request. toll keeps a fixed-size sketch instead: a few MB covers millions of keys, with no eviction and no hop. The cost is that limits are *approximate* — see the error contract below.
+The standard per-key limiter keeps one bucket per key in a hashmap. Memory grows with key cardinality, so you add LRU eviction — and eviction *is* the failure mode: evicting an active abuser's bucket hands them a fresh one. Redis-backed limiters fix the memory by adding a network hop to every request. toll keeps a fixed-size sketch instead: a few MB covers any number of keys, nothing is ever evicted, and decisions stay in-process.
 
-## How it works
+The trade is that limits are **approximate** — but approximate in one direction only, which is the part worth reading carefully.
 
-A key's tokens-spent (debt) lives in the sketch; a fresh, never-seen key reads debt 0 — a full bucket — for free. Each request checks headroom (`spent + cost ≤ Burst`) and, if it fits, debits `cost`. Between requests, grudge's `Linear(Rate)` decay drains the debt at the refill rate. That's a token bucket, in constant memory, over an unbounded key space. (A debt cell under linear decay is exactly GCRA's theoretical arrival time — the algorithm inside most production Redis limiters — run through a sketch instead of a per-key map.)
+## The error contract
 
-## The error contract — read this
+- **For any stable key, collisions only make the limiter stricter — never more permissive.** A key's debt estimate is its own debt plus (possibly) colliding keys' debt, so it can only be over-counted. A heavy key never gets extra allowance from sketch error, and an innocent key is throttled early only if *all* of its hash cells collide with hot keys: probability `(1 − (1 − 1/M)^H)^L`, about 10⁻⁸ at the defaults with a thousand concurrently-hot keys, and time-bounded because the sketch periodically re-hashes (rotation).
+- **The only permissive gap is across key identities.** An adversary who rotates keys evades per-key debt — true of any per-key limiter ("what is a key?"). But every admitted request debits every sketch level, and each level drains at most `CellsPerLevel × Rate` tokens/sec, so under key-rotation abuse toll degrades into a coarse *aggregate* limiter. **It fails closed, not open.** Size `CellsPerLevel × Rate` at or above your intended total capacity so this backstop only engages under abuse.
+- **toll is node-local.** Behind N replicas, effective limits multiply by ~N unless you shard traffic by key or divide `Rate` per replica. Cross-instance convergence is planned on top of grudge's mergeable update algebra, but is not in v1.
 
-toll's limits are approximate, and the approximation is **one-sided by construction**:
+## Variable cost, honest Retry-After
 
-- **For a stable key, collisions only make the limiter stricter, never more permissive.** A key's debt estimate is its own debt plus any colliding keys' debt, so it can only be over-counted. A heavy key never gets *extra* allowance from collision math, and an innocent key is throttled early only if all of its hash cells collide with hot keys — probability `(1 − (1 − 1/M)^H)^L`, tiny at the defaults and time-bounded by rotation.
-- **The only permissive gap is across key identities.** An adversary who rotates keys evades per-key debt — unavoidable for any per-key limiter. But every admitted request debits every level, so each level drains at most `M·Rate` tokens/sec: under key-rotation abuse the limiter degrades into a coarse *aggregate* limiter and **fails closed, not open**. Size `CellsPerLevel · Rate` at or above your intended total capacity so this backstop engages only under abuse.
-- **toll is node-local.** Behind N replicas, per-key limits and the aggregate ceiling scale with N unless you shard traffic by key or divide `Rate` per replica. Cross-instance convergence is planned (grudge's update algebra is designed for mergeable replicas) but not in v1.
+Cost is per-request, so you can limit by whatever a request actually consumes — tokens for an LLM call, bytes for bandwidth, 1 for plain QPS:
 
-## Variable cost and Retry-After
+```go
+if l.AllowN(apiKey, float64(promptTokens)) { ... }
+```
 
-Cost is per-request, so toll limits by whatever a request actually consumes — tokens for an LLM call, bytes for bandwidth, 1 for plain QPS. And because refill is linear, the wait until a rejected request would fit is closed-form, so toll can hand you a correct `Retry-After`:
+Because refill is linear, the wait until a rejected request fits is closed-form, so toll reports an exact `Retry-After` where windowed limiters guess — and it stays honest when reject penalties are configured (the reported wait includes the penalty the limiter just applied):
 
 ```go
 d := l.AllowDetailed(key, cost)
 if !d.Allowed {
     if d.RetryAfter == toll.NeverRetry {
-        // cost exceeds Burst; no wait ever admits it
+        http.Error(w, "request exceeds capacity", http.StatusRequestEntityTooLarge)
     } else {
         w.Header().Set("Retry-After", strconv.Itoa(int(d.RetryAfter.Seconds())))
+        http.Error(w, "rate limited", http.StatusTooManyRequests)
     }
 }
 ```
 
-A `cost` larger than `Burst` is legal traffic (rejected, `NeverRetry`); a NaN, infinite, or non-positive `cost` is a programming error and panics.
+A `cost` larger than `Burst` is legal traffic — rejected with `NeverRetry`, since no wait admits it. A NaN, infinite, or non-positive cost is a programming error and panics.
 
-## Strict vs optimistic
+## Optimistic or strict
 
-By default admission is optimistic (check then debit) — under same-key concurrency it can over-admit by the number of racing callers, which is noise next to sketch error. When you need hard quotas, set `Strict: true` and admission becomes atomic (grudge's all-levels conditional-consume):
+Default admission is check-then-debit: under same-key concurrency it can over-admit by the number of racing callers, which is noise next to sketch error and costs the least. When you need hard quotas, `Strict: true` makes admission atomic (grudge's conditional-consume holds all the key's cell locks):
 
 ```go
 l, _ := toll.New(toll.Config{Rate: 100, Burst: 200, Strict: true})
 ```
 
+## Punishing the hammer
+
+Pure token buckets forgive hammering: rejected requests cost nothing, so clients that retry in a tight loop lose nothing by it. Opt into penalties when that matters:
+
+```go
+l, _ := toll.New(toll.Config{
+    Rate: 100, Burst: 200,
+    RejectCost: 10,   // each rejected attempt adds debt…
+    MaxDebt:    1000, // …extending recovery up to MaxDebt/Rate seconds
+})
+```
+
+With `RejectCost`, hammering while limited pushes recovery further out (bounded by `MaxDebt/Rate`); a client that backs off and honors `Retry-After` is admitted on its first retry.
+
 ## Adversarial keys
 
-A rate limiter's keys are usually attacker-controlled, so toll defaults to the **SipHash** keyed PRF — an attacker who doesn't know the per-process key can't manufacture the hash collisions that would let them grief a victim's limit. If your keys are trusted (internal IDs), opt into faster murmur3:
+A public rate limiter's keys are attacker-controlled by definition, so toll defaults to the **SipHash** keyed PRF: without the per-process key, an attacker can't manufacture the hash collisions that would let them grief a victim's limit. If your keys are trusted (internal service names, tenant IDs you issue), opt into faster murmur3:
 
 ```go
 l, _ := toll.New(toll.Config{Rate: 100, Burst: 200, TrustedKeys: true})
 ```
 
-## Multiple limits at once
+## Several limits at once
 
-Compose per-second and per-hour, or per-user and per-IP, with a `MultiLimiter`: it admits only when every member would, and debits none of them when any rejects.
+`MultiLimiter` composes buckets — per-second and per-hour, per-user and per-IP — admitting only when every member would, and debiting none when any rejects:
 
 ```go
 perSec  := must(toll.New(toll.Config{Rate: 100, Burst: 200}))
@@ -83,13 +100,24 @@ defer m.Close()
 if m.Allow(key) { serve() }
 ```
 
+Composition uses non-mutating checks, so it is always optimistic (even over `Strict` members) and never applies members' `RejectCost`.
+
+## When toll is the wrong tool
+
+Honesty section. Reach for something else when:
+
+- **You need exact per-key accounting** — billing, hard contractual quotas where over-*throttling* a colliding key is unacceptable. The sketch's conservative error is tiny but nonzero; a map or a database is exact.
+- **You need one global limit across a fleet today.** toll is node-local in v1; a Redis/gateway limiter gives you global enforcement at the cost of the hop.
+- **Your key cardinality is small and bounded** (dozens of tenants): a plain map of `golang.org/x/time/rate` limiters is simpler and exact — toll's advantage begins where per-key state stops being affordable.
+- **You need blocking/reservation semantics** (`Wait(ctx)`): not in v1.
+
 ## Sizing
 
-Defaults are `Levels=4, CellsPerLevel=100000` (~6.4 MB of sketch payload per generation, false-positive ≈ 10⁻⁸ at 1000 concurrently-hot keys). The one rule to remember: **`CellsPerLevel · Rate` bounds the aggregate backstop**, so keep it at or above your intended total admitted rate. `grudge.SuggestLevels` sizes `Levels` for a target false-positive probability.
+Defaults: `Levels=4, CellsPerLevel=100_000` — roughly 6.4 MB of cell payload per generation (two generations by default), false-positive ≈ 10⁻⁸ with a thousand concurrently-hot keys. The one rule to remember: **`CellsPerLevel × Rate` is the aggregate backstop**, keep it at or above your intended total admitted rate. `grudge.SuggestLevels` sizes `Levels` for a target false-positive probability.
 
 ## Performance
 
-Single-key, uncontended (see [BENCHMARKS.md](BENCHMARKS.md)):
+Single-key, uncontended, Apple Silicon (see [BENCHMARKS.md](BENCHMARKS.md)):
 
 | Operation | ns/op | allocs/op |
 |---|---|---|
@@ -97,11 +125,11 @@ Single-key, uncontended (see [BENCHMARKS.md](BENCHMARKS.md)):
 | AllowN (strict) | ~110 | 0 |
 | AllowDetailed | ~114 | 0 |
 
-Zero allocations on the hot path is enforced by tests, not just measured.
+Zero allocations on the hot path is enforced by tests (`testing.AllocsPerRun`), not just observed on a good day.
 
-## Scope
+## Scope and lineage
 
-toll is a rate limiter and nothing more: no blocking `Wait`, no HTTP/gRPC middleware in the core (those belong in subpackages), no per-key rate overrides (use one limiter per tier), no cross-instance state sync (waits on grudge serialization). The normative specification is in [spec/SPEC.md](spec/SPEC.md).
+toll is a rate limiter and nothing more — no middleware in the core (subpackages later), no per-key rate overrides (run one limiter per tier), no cross-instance sync yet. The normative spec lives in [spec/SPEC.md](spec/SPEC.md). The underlying sketch, [grudge](https://github.com/satmihir/grudge), was extracted from [FAIR](https://github.com/satmihir/fair)'s Stochastic Fair BLUE core; a debt cell under linear decay is GCRA's theoretical arrival time run through a sketch, so toll is, in a precise sense, GCRA for unbounded key spaces.
 
 ## Development
 
