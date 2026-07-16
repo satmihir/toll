@@ -1,6 +1,6 @@
 # toll v1 Specification
 
-**Status:** Approved for implementation
+**Status:** Implemented (M1–M5); amendments tracked in git history
 **Module:** `github.com/satmihir/toll`
 **Depends on:** `github.com/satmihir/grudge` v0.1.0 (the only non-test dependency)
 **Origin:** distilled from `satmihir/fair` `ideas/ratelimiter.md`
@@ -191,11 +191,21 @@ With `RejectCost = 0`, `debt' = spent` and the formula reduces to the plain
 form.
 
 In optimistic mode `spent` comes from the Query already performed. In strict
-mode TryUpdate returns only a verdict, so `Spent` and `RetryAfter` come from
-a follow-up `Query` — advisory and slightly racy, which is acceptable because
-Decision fields are observability, never admission input. (If this proves
-unsatisfying, the fix is a `TryUpdateDetailed` in grudge — amend that spec,
-don't work around it here.)
+mode TryUpdate returns only a verdict, so `Spent` and `RetryAfter` MUST come
+from a **follow-up** `Query` — never a query taken before TryUpdate. A
+pre-decision query races: another caller can consume the remaining headroom
+between the query and the failed TryUpdate, producing the contradiction
+`Allowed == false, RetryAfter == 0`. Concretely: on admit, reconstruct
+`Spent = max(0, followUpQuery − cost)`; on reject, `spent = followUpQuery`
+taken **before** the reject penalty is applied (so the `debt'` formula does
+not double-count RejectCost). These are advisory and slightly racy, which is
+acceptable because Decision fields are observability, never admission input.
+(If this proves unsatisfying, the fix is a `TryUpdateDetailed` in grudge —
+amend that spec, don't work around it here.)
+
+On rejection `RetryAfter` MUST be ≥ 1ms: a rejection whose follow-up query
+already shows headroom means the caller lost a race and should retry
+immediately, but `0` is reserved for `Allowed` so callers can branch on it.
 
 RetryAfter is a lower bound in the presence of contention (other traffic may
 add debt while the caller waits); callers retry, they don't reserve.
@@ -231,13 +241,32 @@ Zero-value Config fields resolve to:
 | `Levels` | 4 | with M=100k: false-positive ≈ 10⁻⁸ at H=1000 |
 | `CellsPerLevel` | 100_000 | ~6.4 MB payload/generation; backstop `M·Rate` |
 | `Generations` | 2 | FAIR-proven |
-| `RotationPeriod` | `max(5min, 10 × Burst/Rate)` | Period ≫ drain time, so the debt horizon a fresh generation misses is noise |
+| `RotationPeriod` | `clamp(10 × horizon, 5min, 24h)`, raised back to `horizon` if the 24h cap would violate the invariant below, where `horizon = MaxDebt/(Rate·(Generations−1))` | see rotation invariant |
 | `MaxDebt` | `Burst` | standard token bucket |
+
+**Rotation invariant (conservative contract under rotation).** grudge's
+rotator only dual-writes to generations that exist: a fresh generation knows
+nothing written before its creation, so debt older than
+`(Generations−1) × RotationPeriod` vanishes at promotion. If that window is
+shorter than the worst-case recovery time `MaxDebt/Rate`, a maxed-out stable
+key gets fresh allowance at rotation — violating "collisions and mechanics
+only make the limiter stricter." Therefore:
+
+```
+(Generations − 1) × RotationPeriod  ≥  MaxDebt / Rate
+```
+
+MUST hold. The derived default satisfies it with 10× margin; a user-supplied
+`RotationPeriod` that violates it is a validation error, not a warning. If
+`MaxDebt/Rate` exceeds one year, `New` MUST reject the config outright (the
+recovery horizon is unusable and the derived period would overflow ordinary
+Durations).
 
 `New` MUST reject (error, not panic): `Rate ≤ 0` or non-finite; `Burst ≤ 0`
 or non-finite; `MaxDebt` non-zero and `< Burst`, or non-finite; `RejectCost`
 negative or non-finite; `Generations == 1` (0 means default);
-`RotationPeriod < 0`. Anything grudge's own validation rejects propagates.
+`RotationPeriod < 0`; the rotation invariant above. Anything grudge's own
+validation rejects propagates.
 
 Call-time panics (programming errors): NaN/±Inf/≤ 0 `cost` on any method
 taking cost.

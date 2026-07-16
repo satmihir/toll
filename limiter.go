@@ -26,6 +26,9 @@ func New(cfg Config) (*Limiter, error) {
 		return nil, err
 	}
 	levels, cells, gens, maxDebt, period, hasher := cfg.resolved()
+	if err := cfg.validateResolved(gens, maxDebt, period); err != nil {
+		return nil, err
+	}
 
 	rot, err := grudge.NewRotator(grudge.RotatorConfig{
 		Sketch: grudge.Config{

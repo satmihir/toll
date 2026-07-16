@@ -1,6 +1,8 @@
 // Package toll is a per-key token-bucket rate limiter for unbounded,
 // potentially attacker-controlled key spaces in constant memory: no per-key
-// state, no eviction, no background work, O(L) per decision.
+// state, no eviction, no per-key cleanup or background scanning, O(L) per
+// decision. (Each Limiter does own one background rotation timer; that is the
+// only background activity, and it is O(1), not per-key.)
 //
 // It is a thin policy layer over github.com/satmihir/grudge, a decaying-score
 // sketch. toll stores each key's spent tokens (debt) in the sketch, drains it

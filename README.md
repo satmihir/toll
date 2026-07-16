@@ -4,14 +4,17 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/satmihir/toll.svg)](https://pkg.go.dev/github.com/satmihir/toll)
 [![Go Report Card](https://goreportcard.com/badge/github.com/satmihir/toll)](https://goreportcard.com/report/github.com/satmihir/toll)
 
-**Token-bucket rate limiting for millions of keys in a few megabytes — no per-key state, no eviction, no network hop.**
+**Token-bucket rate limiting for millions of keys in fixed memory — no per-key state, no eviction, no network hop.**
 
-toll rate-limits an unbounded set of keys (client IDs, tenants, IPs, API keys…) in fixed memory with ~110ns zero-allocation decisions. It is built on [grudge](https://github.com/satmihir/grudge), a constant-memory decaying-score sketch: toll stores each key's *spent tokens* as sketch debt and lets grudge's linear decay refill them.
+toll rate-limits an unbounded set of keys (client IDs, tenants, IPs, API keys…) in fixed memory — 19 MB measured at the defaults, tunable down to a couple of MB — with ~300ns zero-allocation admitted decisions. It is built on [grudge](https://github.com/satmihir/grudge), a constant-memory decaying-score sketch: toll stores each key's *spent tokens* as sketch debt and lets grudge's linear decay refill them.
 
 ```go
 import "github.com/satmihir/toll"
 
 l, err := toll.New(toll.Config{Rate: 100, Burst: 200}) // 100 tokens/sec, bursts to 200
+if err != nil {
+    log.Fatal(err)
+}
 defer l.Close()
 
 if l.Allow(clientID) {
@@ -21,9 +24,15 @@ if l.Allow(clientID) {
 }
 ```
 
+## See it under load
+
+[![toll demo: noisy neighbors and a key-rotation attack](demo/visual/toll-demo-thumbnail.png)](demo/visual/toll-demo.mp4)
+
+Three greedy clients grabbing 83% of an API, held to exactly their limit with zero compliant-client rejections — then a 5,000 req/s key-rotation attack that a map-of-buckets limiter admits in full (state growing forever) while toll caps it at the sizing ceiling in 125 KB of flat state. Deterministic simulation of the real API; see [demo/visual](demo/visual/README.md) to regenerate.
+
 ## Why not a map of buckets?
 
-The standard per-key limiter keeps one bucket per key in a hashmap. Memory grows with key cardinality, so you add LRU eviction — and eviction *is* the failure mode: evicting an active abuser's bucket hands them a fresh one. Redis-backed limiters fix the memory by adding a network hop to every request. toll keeps a fixed-size sketch instead: a few MB covers any number of keys, nothing is ever evicted, and decisions stay in-process.
+The standard per-key limiter keeps one bucket per key in a hashmap. Memory grows with key cardinality, so you add LRU eviction — and eviction *is* the failure mode: evicting an active abuser's bucket hands them a fresh one. Redis-backed limiters fix the memory by adding a network hop to every request. toll keeps a fixed-size sketch instead: one fixed footprint covers any number of keys, nothing is ever evicted, and decisions stay in-process.
 
 The trade is that limits are **approximate** — but approximate in one direction only, which is the part worth reading carefully.
 
@@ -49,7 +58,7 @@ if !d.Allowed {
     if d.RetryAfter == toll.NeverRetry {
         http.Error(w, "request exceeds capacity", http.StatusRequestEntityTooLarge)
     } else {
-        w.Header().Set("Retry-After", strconv.Itoa(int(d.RetryAfter.Seconds())))
+        w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.RetryAfter.Seconds())))) // round UP: 500ms must not become "0"
         http.Error(w, "rate limited", http.StatusTooManyRequests)
     }
 }
@@ -89,7 +98,7 @@ l, _ := toll.New(toll.Config{Rate: 100, Burst: 200, TrustedKeys: true})
 
 ## Several limits at once
 
-`MultiLimiter` composes buckets — per-second and per-hour, per-user and per-IP — admitting only when every member would, and debiting none when any rejects:
+`MultiLimiter` composes multiple *windows* for one identity — per-second and per-hour on the same key — admitting only when every member would, and debiting none when any rejects:
 
 ```go
 perSec  := must(toll.New(toll.Config{Rate: 100, Burst: 200}))
@@ -98,6 +107,16 @@ m := toll.NewMulti(perSec, perHour)
 defer m.Close()
 
 if m.Allow(key) { serve() }
+```
+
+Heterogeneous identities — limit per-user *and* per-IP — need different keys per limiter, which `MultiLimiter` (one key for all members) can't express; use the check/debit primitives directly:
+
+```go
+if perUser.WouldAllowN(userKey, 1) && perIP.WouldAllowN(ipKey, 1) {
+    perUser.DebitN(userKey, 1)
+    perIP.DebitN(ipKey, 1)
+    serve()
+}
 ```
 
 Composition uses non-mutating checks, so it is always optimistic (even over `Strict` members) and never applies members' `RejectCost`.
@@ -113,19 +132,22 @@ Honesty section. Reach for something else when:
 
 ## Sizing
 
-Defaults: `Levels=4, CellsPerLevel=100_000` — roughly 6.4 MB of cell payload per generation (two generations by default), false-positive ≈ 10⁻⁸ with a thousand concurrently-hot keys. The one rule to remember: **`CellsPerLevel × Rate` is the aggregate backstop**, keep it at or above your intended total admitted rate. `grudge.SuggestLevels` sizes `Levels` for a target false-positive probability.
+Defaults: `Levels=4, CellsPerLevel=100_000, Generations=2` — **19.2 MB measured** (800k cells × 24 bytes each including per-cell locks; the float payload alone is 12.8 MB), false-positive ≈ 10⁻⁸ with a thousand concurrently-hot keys. Memory is fixed regardless of key count and scales with `Levels × CellsPerLevel × Generations`: `CellsPerLevel=10_000` brings it to ~2 MB. The one rule to remember: **`CellsPerLevel × Rate` is the aggregate backstop**, keep it at or above your intended total admitted rate. `grudge.SuggestLevels` sizes `Levels` for a target false-positive probability.
+
+Rotation has one invariant, enforced at construction: `(Generations−1) × RotationPeriod ≥ MaxDebt/Rate`, so debt can never quietly vanish at generation promotion. The derived default period satisfies it with 10× margin.
 
 ## Performance
 
-Single-key, uncontended, Apple Silicon (see [BENCHMARKS.md](BENCHMARKS.md)):
+Apple M1 Pro (full methodology and contention numbers in [BENCHMARKS.md](BENCHMARKS.md)):
 
 | Operation | ns/op | allocs/op |
 |---|---|---|
-| Allow / AllowN | ~114 | 0 |
-| AllowN (strict) | ~110 | 0 |
-| AllowDetailed | ~114 | 0 |
+| Allow, admitted (SipHash default) | ~322 | 0 |
+| Allow, admitted (strict) | ~206 | 0 |
+| Allow, rejected | ~69 | 0 |
+| Allow, admitted, 64k distinct keys | ~686 | 0 |
 
-Zero allocations on the hot path is enforced by tests (`testing.AllocsPerRun`), not just observed on a good day.
+Admitted and rejected paths are benchmarked separately (rejection is Query-only and much cheaper — a single-key benchmark that mostly rejects would flatter the numbers). Zero allocations on the hot path is enforced by tests (`testing.AllocsPerRun`), not just observed on a good day. One non-obvious result: for admitted traffic, strict mode is *faster* than optimistic — one all-locks pass beats two lock-per-cell passes — so choose optimistic for its cheap rejections and finer-grained locking, not for admitted-path speed.
 
 ## Scope and lineage
 

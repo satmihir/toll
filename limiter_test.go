@@ -171,14 +171,3 @@ func TestHotPathAllocations(t *testing.T) {
 	check("AllowN", func() { l.AllowN(key, 1) })
 	check("Spent", func() { _ = l.Spent(key) })
 }
-
-func BenchmarkAllow(b *testing.B) {
-	l, _ := New(Config{Rate: 100, Burst: 1000, CellsPerLevel: 100_000, Ticker: grudgetest.NewFakeTicker()})
-	defer l.Close()
-	key := []byte("client-42")
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		l.Allow(key)
-	}
-}

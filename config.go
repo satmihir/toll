@@ -102,7 +102,7 @@ func (cfg Config) resolved() (levels, cells, gens uint32, maxDebt float64, perio
 	}
 	period = cfg.RotationPeriod
 	if period == 0 {
-		period = defaultPeriod(cfg.Burst, cfg.Rate)
+		period = defaultPeriod(maxDebt, cfg.Rate, gens)
 	}
 	hasher = grudge.SipHash()
 	if cfg.TrustedKeys {
@@ -111,18 +111,58 @@ func (cfg Config) resolved() (levels, cells, gens uint32, maxDebt float64, perio
 	return
 }
 
-// defaultPeriod picks a rotation period much longer than the bucket drain time
-// (so a freshly promoted generation misses only a negligible debt horizon),
-// floored at 5 minutes and ceilinged at 24 hours (the latter also guards the
-// float->Duration conversion against overflow at a pathologically low Rate).
-func defaultPeriod(burst, rate float64) time.Duration {
-	seconds := 10 * burst / rate
-	if seconds >= defaultPeriodCeil.Seconds() {
-		return defaultPeriodCeil
+// maxRecoveryHorizon bounds MaxDebt/Rate: beyond a year the config is
+// unusable (and derived periods would stop meaning anything).
+const maxRecoveryHorizon = 365 * 24 * time.Hour
+
+// validateResolved checks constraints that need the post-default values.
+func (cfg Config) validateResolved(gens uint32, maxDebt float64, period time.Duration) error {
+	if maxDebt/cfg.Rate > maxRecoveryHorizon.Seconds() {
+		return fmt.Errorf("toll: MaxDebt/Rate recovery horizon is %.3gs (over a year); raise Rate or lower MaxDebt", maxDebt/cfg.Rate)
 	}
-	p := time.Duration(seconds * float64(time.Second))
+	return checkRotationInvariant(period, maxDebt, cfg.Rate, gens)
+}
+
+// rotationHorizonSeconds is the recovery window each pre-primary generation
+// must cover so that debt cannot vanish at promotion: MaxDebt/(Rate·(gens−1)).
+func rotationHorizonSeconds(maxDebt, rate float64, gens uint32) float64 {
+	return maxDebt / rate / float64(gens-1)
+}
+
+// checkRotationInvariant enforces the conservative contract under rotation:
+// grudge's rotator only dual-writes to generations that exist, so a fresh
+// generation knows nothing written before its creation. Debt older than
+// (Generations−1)×RotationPeriod vanishes at promotion; if that window is
+// shorter than the worst-case recovery time MaxDebt/Rate, a maxed-out stable
+// key gets fresh allowance at rotation — the one thing this limiter promises
+// never happens. See spec §4.
+func checkRotationInvariant(period time.Duration, maxDebt, rate float64, gens uint32) error {
+	if period.Seconds() < rotationHorizonSeconds(maxDebt, rate, gens) {
+		return fmt.Errorf(
+			"toll: rotation invariant violated: (Generations-1)*RotationPeriod = %v must be >= MaxDebt/Rate = %vs, "+
+				"or debt vanishes at generation promotion and a maxed-out key regains allowance; "+
+				"lengthen RotationPeriod, add Generations, or shrink MaxDebt",
+			time.Duration(float64(gens-1)*period.Seconds())*time.Second, maxDebt/rate)
+	}
+	return nil
+}
+
+// defaultPeriod picks a rotation period with 10x margin over the per-generation
+// recovery horizon, floored at 5 minutes and capped at 24 hours — except that
+// the cap is lifted back to the horizon when honoring it would break the
+// rotation invariant (a long-recovery config gets a long period, not a broken
+// contract).
+func defaultPeriod(maxDebt, rate float64, gens uint32) time.Duration {
+	horizon := rotationHorizonSeconds(maxDebt, rate, gens)
+	p := time.Duration(10 * horizon * float64(time.Second))
 	if p < defaultPeriodFloor {
-		return defaultPeriodFloor
+		p = defaultPeriodFloor
+	}
+	if p > defaultPeriodCeil {
+		p = defaultPeriodCeil
+		if p.Seconds() < horizon {
+			p = time.Duration(horizon * float64(time.Second))
+		}
 	}
 	return p
 }
