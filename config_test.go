@@ -53,15 +53,49 @@ func TestConfigValidation(t *testing.T) {
 
 func TestDefaultPeriod(t *testing.T) {
 	// Fast drain -> floored at 5 minutes.
-	if got := defaultPeriod(10, 1000); got != defaultPeriodFloor {
+	if got := defaultPeriod(10, 1000, 2); got != defaultPeriodFloor {
 		t.Errorf("fast drain period = %v, want floor %v", got, defaultPeriodFloor)
 	}
-	// Pathologically slow rate -> ceilinged at 24h, no overflow.
-	if got := defaultPeriod(1e12, 1e-9); got != defaultPeriodCeil {
-		t.Errorf("slow drain period = %v, want ceil %v", got, defaultPeriodCeil)
-	}
-	// Moderate: 10 * (100/2) = 500s, between floor and ceil.
-	if got := defaultPeriod(100, 2); got != 500*time.Second {
+	// Moderate: horizon = 100/2 = 50s, 10x = 500s, between floor and ceil.
+	if got := defaultPeriod(100, 2, 2); got != 500*time.Second {
 		t.Errorf("moderate period = %v, want 500s", got)
+	}
+	// Long recovery: horizon 1e6s (~11.6 days) exceeds the 24h cap, so the cap
+	// is lifted back to the horizon to preserve the rotation invariant.
+	if got := defaultPeriod(1e6, 1, 2); got != time.Duration(1e6*float64(time.Second)) {
+		t.Errorf("long-recovery period = %v, want horizon 1e6s", got)
+	}
+	// More generations shrink the per-generation horizon:
+	// maxDebt=600, rate=1, gens=3 -> horizon 300s -> 10x = 3000s.
+	if got := defaultPeriod(600, 1, 3); got != 3000*time.Second {
+		t.Errorf("gens=3 period = %v, want 3000s", got)
+	}
+}
+
+func TestRotationInvariantValidation(t *testing.T) {
+	// Violating period: horizon = MaxDebt/Rate = 600s, period 60s < 600s.
+	_, err := New(Config{Rate: 1, Burst: 10, MaxDebt: 600, RotationPeriod: time.Minute,
+		Ticker: grudgetest.NewFakeTicker()})
+	if err == nil {
+		t.Fatal("expected rotation-invariant error for short period")
+	}
+	// Compliant period: exactly the horizon.
+	l, err := New(Config{Rate: 1, Burst: 10, MaxDebt: 600, RotationPeriod: 600 * time.Second,
+		Ticker: grudgetest.NewFakeTicker()})
+	if err != nil {
+		t.Fatalf("compliant period rejected: %v", err)
+	}
+	l.Close()
+	// More generations divide the requirement: 3 gens, 300s period covers 600s.
+	l2, err := New(Config{Rate: 1, Burst: 10, MaxDebt: 600, Generations: 3,
+		RotationPeriod: 300 * time.Second, Ticker: grudgetest.NewFakeTicker()})
+	if err != nil {
+		t.Fatalf("3-generation compliant period rejected: %v", err)
+	}
+	l2.Close()
+	// Horizon over a year rejects outright, even with defaults.
+	_, err = New(Config{Rate: 1e-9, Burst: 1, Ticker: grudgetest.NewFakeTicker()})
+	if err == nil {
+		t.Fatal("expected error for over-a-year recovery horizon")
 	}
 }

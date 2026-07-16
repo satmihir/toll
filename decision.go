@@ -35,12 +35,19 @@ func (l *Limiter) AllowDetailed(key []byte, cost float64) Decision {
 	}
 
 	if l.strict {
-		spent := l.rot.Query(key) // advisory, pre-decision
+		// Spent/RetryAfter MUST come from a follow-up query (spec §3.2): a
+		// pre-decision query races — another caller can consume the remaining
+		// headroom before TryUpdate, yielding Allowed=false with RetryAfter=0.
 		if l.rot.TryUpdate(key, cost, l.burst) {
+			spent := l.rot.Query(key) - cost // reconstruct pre-debit estimate
+			if spent < 0 {
+				spent = 0
+			}
 			return Decision{Allowed: true, Spent: spent, Limit: l.burst}
 		}
+		spent := l.rot.Query(key) // post-race, pre-penalty (retryAfter adds RejectCost itself)
 		l.penalize(key)
-		return Decision{Allowed: false, Spent: spent, Limit: l.burst, RetryAfter: l.retryAfter(spent, cost)}
+		return Decision{Allowed: false, Spent: spent, Limit: l.burst, RetryAfter: l.rejectRetryAfter(spent, cost)}
 	}
 
 	spent := l.rot.Query(key)
@@ -49,7 +56,18 @@ func (l *Limiter) AllowDetailed(key []byte, cost float64) Decision {
 		return Decision{Allowed: true, Spent: spent, Limit: l.burst}
 	}
 	l.penalize(key)
-	return Decision{Allowed: false, Spent: spent, Limit: l.burst, RetryAfter: l.retryAfter(spent, cost)}
+	return Decision{Allowed: false, Spent: spent, Limit: l.burst, RetryAfter: l.rejectRetryAfter(spent, cost)}
+}
+
+// rejectRetryAfter is retryAfter floored at 1ms: on a rejection, a computed
+// wait of 0 means the caller lost a race and headroom already exists — advise
+// an immediate retry, but keep RetryAfter == 0 reserved for Allowed so callers
+// can branch on it (spec §3.2).
+func (l *Limiter) rejectRetryAfter(spent, cost float64) time.Duration {
+	if ra := l.retryAfter(spent, cost); ra > 0 {
+		return ra
+	}
+	return time.Millisecond
 }
 
 // retryAfter returns the time for enough debt to drain that cost would fit,
