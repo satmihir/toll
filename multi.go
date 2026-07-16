@@ -1,11 +1,16 @@
 package toll
 
-// MultiLimiter enforces several Limiters at once — e.g. a per-second and a
-// per-hour bucket, or per-user and per-IP — admitting only when every member
-// would admit. It implements the check-then-debit recipe: consult all limiters,
-// and debit all only if all pass, so a request rejected by one limiter does not
-// consume tokens in the others. Not atomic under concurrency (same race class
-// as a single limiter's optimistic path).
+// MultiLimiter enforces several Limiters at once for ONE identity — e.g. a
+// per-second and a per-hour bucket on the same key — admitting only when every
+// member would admit. It implements the check-then-debit recipe: consult all
+// limiters, and debit all only if all pass, so a request rejected by one
+// limiter does not consume tokens in the others. Not atomic under concurrency
+// (same race class as a single limiter's optimistic path).
+//
+// Every member receives the same key, so MultiLimiter cannot express
+// heterogeneous-identity composition (per-user AND per-IP); for that, call
+// WouldAllowN on each limiter with its own key, then DebitN on all iff every
+// check passed.
 type MultiLimiter struct {
 	limiters []*Limiter
 }
