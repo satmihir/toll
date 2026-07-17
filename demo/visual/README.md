@@ -9,8 +9,10 @@ A 36-second, trace-driven animation of toll under load, in three acts:
 3. **Key-rotation attack** (5,000 req/s, fresh key per request) — a map of token
    buckets admits 100% with state growing forever; toll caps admission at the
    aggregate ceiling (`CellsPerLevel × Rate = 2,000/s`, with `MaxDebt` headroom so
-   debt accumulates) in 125 KB of flat state. An LRU-capped map would bound the
-   memory but still fail open: evicting an active key resets its bucket.
+   debt accumulates — without that headroom the bound is the looser
+   `Levels × CellsPerLevel × Rate`; see the README's error contract) in 188 KB of
+   flat state (24 B/cell: score, timestamp, lock). An LRU-capped map would bound
+   the memory but still fail open: evicting an active key resets its bucket.
 
 Everything on screen replays `trace.js`, recorded by a deterministic simulation
 of the real toll API against a fake clock — the animation never recomputes the

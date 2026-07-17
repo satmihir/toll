@@ -64,9 +64,25 @@ Therefore, and this MUST be stated in the README:
 - The **permissive** failure mode exists only across key *identities* (an
   adversary rotating keys evades per-key debt). Sustained rotation abuse
   saturates cells broadly and the limiter degrades into a coarse **aggregate**
-  limiter with ceiling ~`M·Rate` tokens/sec per level — it fails closed, not
-  open. Deployments MUST size `CellsPerLevel · Rate` at or above intended
-  total capacity so this backstop engages only under abuse.
+  limiter — it fails closed, not open. The ceiling is **conditional**, and
+  docs MUST NOT state the tight form unconditionally:
+  - **Unconditional bound: `L·M·Rate` tokens/sec.** An admitted request's
+    min-cell has headroom by definition (`min ≤ Burst − cost`), so at least
+    one level records the full debit unclamped; total unclamped deposits are
+    ≥ admitted·cost/sec spread over L levels, and each level drains at most
+    `M·Rate` — hence admitted ≤ `L·M·Rate` for unit cost. Holds even with
+    `MaxDebt = Burst` (the default), where cell clamping discards part of
+    the admitted debt (the demo simulation measured ~1.6×`M·Rate` for a
+    5,000/s attack at `M·Rate = 2,000/s`).
+  - **Tight bound: `M·Rate` tokens/sec, armed by `MaxDebt ≫ Burst`.** With
+    headroom, admitted debt accumulates instead of clamping away, the
+    conservation argument binds, and steady-state admission converges to
+    `M·Rate` (the demo measures it exactly at `MaxDebt = 10×Burst`).
+
+  Deployments MUST size the *applicable* ceiling at or above intended total
+  capacity so the backstop engages only under abuse; abuse-facing
+  deployments SHOULD set `MaxDebt ≫ Burst` (≈10×) to arm the tight ceiling
+  (which the §4 rotation invariant then folds into the rotation period).
 
 ---
 
