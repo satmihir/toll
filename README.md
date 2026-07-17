@@ -28,7 +28,7 @@ if l.Allow(clientID) {
 
 [![toll demo: noisy neighbors and a key-rotation attack](demo/visual/toll-demo-thumbnail.png)](demo/visual/toll-demo.mp4)
 
-Three greedy clients grabbing 83% of an API, held to exactly their limit with zero compliant-client rejections — then a 5,000 req/s key-rotation attack that a map-of-buckets limiter admits in full (state growing forever) while toll caps it at the sizing ceiling in 125 KB of flat state. Deterministic simulation of the real API; see [demo/visual](demo/visual/README.md) to regenerate.
+Three greedy clients grabbing 83% of an API, held to exactly their limit with zero compliant-client rejections — then a 5,000 req/s key-rotation attack that a map-of-buckets limiter admits in full (state growing forever) while toll caps it at the sizing ceiling in 188 KB of flat state. Deterministic simulation of the real API; see [demo/visual](demo/visual/README.md) to regenerate.
 
 ## Why not a map of buckets?
 
@@ -39,7 +39,7 @@ The trade is that limits are **approximate** — but approximate in one directio
 ## The error contract
 
 - **For any stable key, collisions only make the limiter stricter — never more permissive.** A key's debt estimate is its own debt plus (possibly) colliding keys' debt, so it can only be over-counted. A heavy key never gets extra allowance from sketch error, and an innocent key is throttled early only if *all* of its hash cells collide with hot keys: probability `(1 − (1 − 1/M)^H)^L`, about 10⁻⁸ at the defaults with a thousand concurrently-hot keys, and time-bounded because the sketch periodically re-hashes (rotation).
-- **The only permissive gap is across key identities.** An adversary who rotates keys evades per-key debt — true of any per-key limiter ("what is a key?"). But every admitted request debits every sketch level, and each level drains at most `CellsPerLevel × Rate` tokens/sec, so under key-rotation abuse toll degrades into a coarse *aggregate* limiter. **It fails closed, not open.** Size `CellsPerLevel × Rate` at or above your intended total capacity so this backstop only engages under abuse.
+- **The only permissive gap is across key identities.** An adversary who rotates keys evades per-key debt — true of any per-key limiter ("what is a key?"). But under key-rotation abuse toll degrades into a coarse *aggregate* limiter: **it fails closed, not open.** The ceiling comes in two strengths. Unconditionally, admission is bounded by `Levels × CellsPerLevel × Rate` (an admitted request's min-cell has headroom by definition, so at least one level always records the full debit). With `MaxDebt ≫ Burst` — recommended ~10× for abuse-facing deployments — admitted debt accumulates instead of clamping away and the bound tightens to `CellsPerLevel × Rate`, which is what the demo shows binding exactly. Size the applicable ceiling at or above your intended total capacity so the backstop only engages under abuse.
 - **toll is node-local.** Behind N replicas, effective limits multiply by ~N unless you shard traffic by key or divide `Rate` per replica. Cross-instance convergence is planned on top of grudge's mergeable update algebra, but is not in v1.
 
 ## Variable cost, honest Retry-After
@@ -68,7 +68,7 @@ A `cost` larger than `Burst` is legal traffic — rejected with `NeverRetry`, si
 
 ## Optimistic or strict
 
-Default admission is check-then-debit: under same-key concurrency it can over-admit by the number of racing callers, which is noise next to sketch error and costs the least. When you need hard quotas, `Strict: true` makes admission atomic (grudge's conditional-consume holds all the key's cell locks):
+Default admission is check-then-debit: under same-key concurrency it can over-admit by the number of racing callers, which is noise next to sketch error. It has the cheapest *rejection* path (a query, ~69ns) and finer-grained locking when different keys share cells; for admitted traffic, `Strict: true` is actually *faster* (one all-locks pass vs. two lock-per-cell passes — see [BENCHMARKS.md](BENCHMARKS.md)) as well as atomic, so pick strict when your workload is mostly admitted traffic or you need hard quotas:
 
 ```go
 l, _ := toll.New(toll.Config{Rate: 100, Burst: 200, Strict: true})
@@ -132,7 +132,7 @@ Honesty section. Reach for something else when:
 
 ## Sizing
 
-Defaults: `Levels=4, CellsPerLevel=100_000, Generations=2` — **19.2 MB measured** (800k cells × 24 bytes each including per-cell locks; the float payload alone is 12.8 MB), false-positive ≈ 10⁻⁸ with a thousand concurrently-hot keys. Memory is fixed regardless of key count and scales with `Levels × CellsPerLevel × Generations`: `CellsPerLevel=10_000` brings it to ~2 MB. The one rule to remember: **`CellsPerLevel × Rate` is the aggregate backstop**, keep it at or above your intended total admitted rate. `grudge.SuggestLevels` sizes `Levels` for a target false-positive probability.
+Defaults: `Levels=4, CellsPerLevel=100_000, Generations=2` — **19.2 MB measured** (800k cells × 24 bytes each including per-cell locks; the float payload alone is 12.8 MB), false-positive ≈ 10⁻⁸ with a thousand concurrently-hot keys. Memory is fixed regardless of key count and scales with `Levels × CellsPerLevel × Generations`: `CellsPerLevel=10_000` brings it to ~2 MB. The one rule to remember: **`CellsPerLevel × Rate` is the aggregate backstop when `MaxDebt ≫ Burst` arms it** (unconditionally it's the looser `Levels × CellsPerLevel × Rate` — see the error contract above); keep the applicable ceiling at or above your intended total admitted rate. `grudge.SuggestLevels` sizes `Levels` for a target false-positive probability.
 
 Rotation has one invariant, enforced at construction: `(Generations−1) × RotationPeriod ≥ MaxDebt/Rate`, so debt can never quietly vanish at generation promotion. The derived default period satisfies it with 10× margin.
 

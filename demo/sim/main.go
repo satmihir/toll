@@ -216,7 +216,9 @@ func simAttack() (samples []actBSample, tollSteady, mapSteady float64) {
 }
 
 func tollStateBytes() int64 {
-	return int64(atkLevels) * atkCells * 16 * generations
+	// 24 bytes per cell on 64-bit Go: float64 score + int64 timestamp +
+	// sync.Mutex — the real footprint, not just the 16-byte payload.
+	return int64(atkLevels) * atkCells * 24 * generations
 }
 
 func main() {

@@ -2,6 +2,7 @@ package toll
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 	"testing"
 
 	"github.com/satmihir/grudge/grudgetest"
@@ -126,7 +127,10 @@ func BenchmarkAllowHighCardinality(b *testing.B) {
 }
 
 // BenchmarkAllowParallel spreads goroutines over distinct keys (uncontended
-// cells, contended rotator RLock).
+// cells, contended rotator RLock). Each worker starts at a distinct, widely
+// separated offset — with a shared starting index every worker would traverse
+// the same key sequence in near-lockstep and accidentally measure same-key
+// contention instead.
 func BenchmarkAllowParallel(b *testing.B) {
 	l := admittedLimiter(b, false, false)
 	defer l.Close()
@@ -136,10 +140,11 @@ func BenchmarkAllowParallel(b *testing.B) {
 		keys[i] = make([]byte, 8)
 		binary.LittleEndian.PutUint64(keys[i], uint64(i))
 	}
+	var workerID int64
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		i := 0
+		i := int(atomic.AddInt64(&workerID, 1)) * 7919 // distinct prime-spaced start
 		for pb.Next() {
 			l.Allow(keys[i&(nKeys-1)])
 			i++
